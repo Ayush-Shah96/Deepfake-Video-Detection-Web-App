@@ -198,24 +198,10 @@ We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for
 3. **Make changes and test**
 4. **Submit pull request**
 
-### Contribution Areas
-- Model improvements and new architectures
-- Additional preprocessing techniques
-- Performance optimizations
-- Documentation enhancements
-- Bug fixes and testing
-- UI/UX improvements
 
 ## 📝 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 📚 Resources
-
-### Research Papers
-- [FaceForensics++: Learning to Detect Manipulated Facial Images](https://arxiv.org/abs/1901.08971)
-- [The DeepFake Detection Challenge (DFDC) Dataset](https://arxiv.org/abs/2006.07397)
-- [EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks](https://arxiv.org/abs/1905.11946)
 
 ### Datasets
 - **DFDC**: Deepfake Detection Challenge Dataset
