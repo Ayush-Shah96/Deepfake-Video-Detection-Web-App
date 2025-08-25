@@ -1,371 +1,315 @@
-import streamlit as st
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torchvision import models
 import cv2
 import numpy as np
-import tempfile
-import os
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import pandas as pd
-from main import DeepfakeDetector
-import time
+import matplotlib.pyplot as plt
+import seaborn as sns
 from PIL import Image
-import io
+import os
+import glob
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
 
-# Page configuration
-st.set_page_config(
-    page_title="Deepfake Video Detection",
-    page_icon="🎥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Check if CUDA is available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        text-align: center;
-        margin-bottom: 2rem;
-        background: linear-gradient(90deg, #ff6b6b, #4ecdc4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    
-    .detection-card {
-        background-color: #f0f0f0;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 5px solid #4CAF50;
-        margin: 1rem 0;
-    }
-    
-    .deepfake-alert {
-        background-color: #ffebee;
-        border-left: 5px solid #f44336;
-        padding: 1rem;
-        border-radius: 5px;
-        margin: 1rem 0;
-    }
-    
-    .real-alert {
-        background-color: #e8f5e8;
-        border-left: 5px solid #4CAF50;
-        padding: 1rem;
-        border-radius: 5px;
-        margin: 1rem 0;
-    }
-    
-    .stProgress .st-bo {
-        background-color: #4CAF50;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Initialize session state
-if 'detector' not in st.session_state:
-    st.session_state.detector = None
-if 'analysis_results' not in st.session_state:
-    st.session_state.analysis_results = None
-if 'processing' not in st.session_state:
-    st.session_state.processing = False
-
-def initialize_detector():
-    """Initialize the deepfake detector"""
-    if st.session_state.detector is None:
-        with st.spinner("Loading deepfake detection model..."):
-            st.session_state.detector = DeepfakeDetector()
-            # Train with minimal synthetic data for demo
-            X_train, y_train = np.random.random((50, 224, 224, 3)), np.random.randint(0, 2, 50)
-            st.session_state.detector.train_model(X_train, y_train, epochs=1)
-
-def create_confidence_gauge(confidence, prediction):
-    """Create a confidence gauge chart"""
-    color = "#f44336" if prediction == "DEEPFAKE" else "#4CAF50"
-    
-    fig = go.Figure(go.Indicator(
-        mode = "gauge+number",
-        value = confidence,
-        domain = {'x': [0, 1], 'y': [0, 1]},
-        title = {'text': f"Confidence: {prediction}"},
-        gauge = {
-            'axis': {'range': [None, 100]},
-            'bar': {'color': color},
-            'steps': [
-                {'range': [0, 50], 'color': "lightgray"},
-                {'range': [50, 80], 'color': "yellow"},
-                {'range': [80, 100], 'color': color}
-            ],
-            'threshold': {
-                'line': {'color': "red", 'width': 4},
-                'thickness': 0.75,
-                'value': 90
-            }
-        }
-    ))
-    
-    fig.update_layout(height=300)
-    return fig
-
-def create_frame_analysis_chart(results):
-    """Create a chart showing frame-by-frame analysis"""
-    if 'frame_predictions' not in results or 'frame_confidences' not in results:
-        return None
-    
-    df = pd.DataFrame({
-        'Frame': range(len(results['frame_predictions'])),
-        'Prediction': results['frame_predictions'],
-        'Confidence': results['frame_confidences']
-    })
-    
-    # Create color mapping
-    df['Color'] = df['Prediction'].map({'DEEPFAKE': 'red', 'REAL': 'green'})
-    
-    fig = px.scatter(df, x='Frame', y='Confidence', color='Prediction',
-                     color_discrete_map={'DEEPFAKE': '#f44336', 'REAL': '#4CAF50'},
-                     title="Frame-by-Frame Analysis",
-                     labels={'Confidence': 'Confidence (%)'})
-    
-    fig.update_layout(height=400)
-    return fig
-
-def create_summary_pie_chart(results):
-    """Create a pie chart showing the distribution of predictions"""
-    if 'deepfake_frames' not in results or 'real_frames' not in results:
-        return None
-    
-    labels = ['Real Frames', 'Deepfake Frames']
-    values = [results['real_frames'], results['deepfake_frames']]
-    colors = ['#4CAF50', '#f44336']
-    
-    fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.3)])
-    fig.update_traces(hoverinfo='label+percent', textinfo='value+percent', 
-                      marker=dict(colors=colors, line=dict(color='#FFFFFF', width=2)))
-    fig.update_layout(title_text="Frame Analysis Summary", height=400)
-    
-    return fig
-
-def process_video(uploaded_file):
-    """Process uploaded video file"""
-    if uploaded_file is None:
-        return None
-    
-    # Save uploaded file temporarily
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        tmp_file_path = tmp_file.name
-    
-    try:
-        # Initialize detector if needed
-        initialize_detector()
+class DeepfakeDetector(nn.Module):
+    """
+    A neural network model for deepfake detection using EfficientNet backbone
+    """
+    def __init__(self, num_classes=2):
+        super(DeepfakeDetector, self).__init__()
+        # Use EfficientNet-B0 as backbone
+        self.backbone = models.efficientnet_b0(pretrained=True)
         
-        # Analyze video
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        status_text.text("Analyzing video frames...")
-        results = st.session_state.detector.analyze_video(tmp_file_path, sample_rate=30)
-        progress_bar.progress(100)
-        status_text.text("Analysis complete!")
-        
-        return results
+        # Replace the classifier
+        num_features = self.backbone.classifier[1].in_features
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
     
-    except Exception as e:
-        st.error(f"Error processing video: {str(e)}")
-        return None
+    def forward(self, x):
+        return self.backbone(x)
+
+class FaceExtractor:
+    """
+    Extract faces from video frames using OpenCV
+    """
+    def __init__(self):
+        # Load face cascade classifier
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+    def extract_faces(self, frame, min_size=(64, 64)):
+        """Extract faces from a single frame"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=min_size)
+        
+        face_crops = []
+        for (x, y, w, h) in faces:
+            # Add some padding around the face
+            padding = int(0.1 * min(w, h))
+            x_start = max(0, x - padding)
+            y_start = max(0, y - padding)
+            x_end = min(frame.shape[1], x + w + padding)
+            y_end = min(frame.shape[0], y + h + padding)
+            
+            face_crop = frame[y_start:y_end, x_start:x_end]
+            if face_crop.size > 0:
+                face_crops.append(face_crop)
+        
+        return face_crops, faces
+
+class VideoProcessor:
+    """
+    Process videos for deepfake detection
+    """
+    def __init__(self, model, face_extractor, transform):
+        self.model = model
+        self.face_extractor = face_extractor
+        self.transform = transform
+        
+    def process_video(self, video_path, max_frames=30, frame_skip=5):
+        """Process video and return deepfake predictions"""
+        cap = cv2.VideoCapture(video_path)
+        predictions = []
+        frame_count = 0
+        processed_frames = 0
+        
+        while cap.isOpened() and processed_frames < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            if frame_count % frame_skip == 0:  # Skip frames for efficiency
+                faces, face_boxes = self.face_extractor.extract_faces(frame)
+                
+                for face in faces:
+                    # Preprocess face
+                    face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+                    face_pil = Image.fromarray(face_rgb)
+                    face_tensor = self.transform(face_pil).unsqueeze(0).to(device)
+                    
+                    # Make prediction
+                    with torch.no_grad():
+                        output = self.model(face_tensor)
+                        prob = torch.softmax(output, dim=1)
+                        fake_prob = prob[0][1].item()  # Probability of being fake
+                        predictions.append(fake_prob)
+                
+                processed_frames += 1
+            
+            frame_count += 1
+        
+        cap.release()
+        return predictions
+
+def create_dummy_model():
+    """
+    Create and return a dummy pre-trained model for demonstration
+    Since we don't have access to actual deepfake detection weights,
+    this creates a model with random weights for demonstration purposes
+    """
+    model = DeepfakeDetector(num_classes=2)
+    model = model.to(device)
+    model.eval()
     
-    finally:
-        # Clean up temporary file
-        if os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
+    print("Note: Using randomly initialized model for demonstration.")
+    print("In practice, you would load pre-trained weights from a deepfake detection dataset.")
+    
+    return model
+
+def download_sample_video():
+    """
+    Download a sample video for testing
+    """
+    # For demonstration, we'll create a simple video using OpenCV
+    # In practice, you would upload your own video or download from a dataset
+    
+    print("Creating a sample video for demonstration...")
+    
+    # Create a simple test video
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter('sample_video.mp4', fourcc, 20.0, (640, 480))
+    
+    for i in range(100):
+        # Create a frame with a simple pattern
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        
+        # Add a simple face-like rectangle
+        cv2.rectangle(frame, (200, 150), (400, 350), (255, 255, 255), 2)
+        cv2.circle(frame, (250, 200), 10, (0, 0, 0), -1)  # Left eye
+        cv2.circle(frame, (350, 200), 10, (0, 0, 0), -1)  # Right eye
+        cv2.rectangle(frame, (275, 250), (325, 280), (0, 0, 0), -1)  # Mouth
+        
+        out.write(frame)
+    
+    out.release()
+    print("Sample video created: sample_video.mp4")
+    return 'sample_video.mp4'
+
+def visualize_results(predictions, video_path):
+    """
+    Visualize the deepfake detection results
+    """
+    plt.figure(figsize=(15, 5))
+    
+    # Plot 1: Prediction timeline
+    plt.subplot(1, 3, 1)
+    plt.plot(predictions, marker='o', linewidth=2, markersize=4)
+    plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.7, label='Threshold')
+    plt.title('Deepfake Probability Over Time')
+    plt.xlabel('Frame/Face Index')
+    plt.ylabel('Fake Probability')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Distribution of predictions
+    plt.subplot(1, 3, 2)
+    plt.hist(predictions, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+    plt.axvline(x=0.5, color='r', linestyle='--', alpha=0.7, label='Threshold')
+    plt.title('Distribution of Predictions')
+    plt.xlabel('Fake Probability')
+    plt.ylabel('Frequency')
+    plt.legend()
+    
+    # Plot 3: Summary statistics
+    plt.subplot(1, 3, 3)
+    avg_prob = np.mean(predictions)
+    max_prob = np.max(predictions)
+    min_prob = np.min(predictions)
+    std_prob = np.std(predictions)
+    
+    stats = ['Average', 'Maximum', 'Minimum', 'Std Dev']
+    values = [avg_prob, max_prob, min_prob, std_prob]
+    colors = ['blue', 'red', 'green', 'orange']
+    
+    bars = plt.bar(stats, values, color=colors, alpha=0.7)
+    plt.title('Prediction Statistics')
+    plt.ylabel('Probability')
+    plt.xticks(rotation=45)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, values):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{value:.3f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print detailed results
+    print(f"\n{'='*50}")
+    print(f"DEEPFAKE DETECTION RESULTS")
+    print(f"{'='*50}")
+    print(f"Video: {video_path}")
+    print(f"Total faces analyzed: {len(predictions)}")
+    print(f"Average fake probability: {avg_prob:.3f}")
+    print(f"Maximum fake probability: {max_prob:.3f}")
+    print(f"Minimum fake probability: {min_prob:.3f}")
+    print(f"Standard deviation: {std_prob:.3f}")
+    
+    threshold = 0.5
+    fake_count = sum(1 for p in predictions if p > threshold)
+    real_count = len(predictions) - fake_count
+    
+    print(f"\nUsing threshold of {threshold}:")
+    print(f"Faces classified as FAKE: {fake_count} ({fake_count/len(predictions)*100:.1f}%)")
+    print(f"Faces classified as REAL: {real_count} ({real_count/len(predictions)*100:.1f}%)")
+    
+    if avg_prob > threshold:
+        print(f"\n🚨 VERDICT: This video is likely a DEEPFAKE (confidence: {avg_prob:.1%})")
+    else:
+        print(f"\n✅ VERDICT: This video appears to be REAL (confidence: {1-avg_prob:.1%})")
 
 def main():
-    # Header
-    st.markdown('<h1 class="main-header">🎥 Deepfake Video Detection</h1>', unsafe_allow_html=True)
+    """
+    Main function to run the deepfake detection system
+    """
+    print("🔍 Deepfake Video Detection System")
+    print("==================================")
     
-    # Sidebar
-    with st.sidebar:
-        st.header("📋 Instructions")
-        st.markdown("""
-        1. Upload a video file (MP4, AVI, MOV)
-        2. Click 'Analyze Video' to start detection
-        3. View detailed results and confidence scores
-        4. Download analysis report (optional)
-        """)
-        
-        st.header("⚙️ Settings")
-        sample_rate = st.slider("Frame Sampling Rate", 1, 60, 30, 
-                               help="Analyze every Nth frame (higher = faster but less accurate)")
-        
-        st.header("ℹ️ About")
-        st.markdown("""
-        This tool uses deep learning to detect deepfake videos by analyzing facial features and temporal inconsistencies.
-        
-        **Note**: This is a demo implementation. Production systems would use more sophisticated models trained on large datasets.
-        """)
+    # Initialize components
+    print("\n1. Initializing model...")
+    model = create_dummy_model()
     
-    # Main content
-    col1, col2 = st.columns([2, 1])
+    print("\n2. Setting up face extractor...")
+    face_extractor = FaceExtractor()
     
-    with col1:
-        st.header("Upload Video")
-        uploaded_file = st.file_uploader(
-            "Choose a video file",
-            type=['mp4', 'avi', 'mov', 'mkv'],
-            help="Upload a video file to analyze for deepfake content"
-        )
-        
-        if uploaded_file is not None:
-            # Display video info
-            st.success(f"✅ Video uploaded: {uploaded_file.name}")
-            st.info(f"📊 File size: {uploaded_file.size / (1024*1024):.2f} MB")
-            
-            # Analyze button
-            if st.button("🔍 Analyze Video", type="primary", disabled=st.session_state.processing):
-                st.session_state.processing = True
-                
-                with st.spinner("Analyzing video for deepfake content..."):
-                    results = process_video(uploaded_file)
-                    if results:
-                        st.session_state.analysis_results = results
-                
-                st.session_state.processing = False
+    print("\n3. Preparing image transforms...")
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
     
-    with col2:
-        if uploaded_file is not None:
-            st.header("Video Preview")
-            st.video(uploaded_file)
+    print("\n4. Creating video processor...")
+    processor = VideoProcessor(model, face_extractor, transform)
     
-    # Results section
-    if st.session_state.analysis_results:
-        results = st.session_state.analysis_results
-        
-        if 'error' in results:
-            st.error(f"❌ Error: {results['error']}")
-            return
-        
-        st.header("🎯 Detection Results")
-        
-        # Main result display
-        prediction = results['overall_prediction']
-        confidence = results['overall_confidence']
-        
-        if prediction == "DEEPFAKE":
-            st.markdown(f"""
-            <div class="deepfake-alert">
-                <h3>⚠️ DEEPFAKE DETECTED</h3>
-                <p><strong>Confidence:</strong> {confidence:.1f}%</p>
-                <p>This video appears to contain deepfake content.</p>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="real-alert">
-                <h3>✅ AUTHENTIC VIDEO</h3>
-                <p><strong>Confidence:</strong> {confidence:.1f}%</p>
-                <p>This video appears to be authentic.</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Detailed metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Overall Confidence", f"{confidence:.1f}%")
-        
-        with col2:
-            st.metric("Deepfake Frames", results['deepfake_frames'])
-        
-        with col3:
-            st.metric("Real Frames", results['real_frames'])
-        
-        with col4:
-            st.metric("Total Analyzed", results['total_analyzed_frames'])
-        
-        # Charts section
-        st.header("📊 Detailed Analysis")
-        
-        tab1, tab2, tab3 = st.tabs(["Confidence Gauge", "Frame Analysis", "Summary"])
-        
-        with tab1:
-            fig_gauge = create_confidence_gauge(confidence, prediction)
-            st.plotly_chart(fig_gauge, use_container_width=True)
-        
-        with tab2:
-            fig_frames = create_frame_analysis_chart(results)
-            if fig_frames:
-                st.plotly_chart(fig_frames, use_container_width=True)
-            else:
-                st.info("Frame analysis data not available")
-        
-        with tab3:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig_pie = create_summary_pie_chart(results)
-                if fig_pie:
-                    st.plotly_chart(fig_pie, use_container_width=True)
-            
-            with col2:
-                st.subheader("Analysis Summary")
-                st.write(f"**Duration:** {results['duration']:.2f} seconds")
-                st.write(f"**Frame Rate:** {results['frame_rate']:.1f} fps")
-                st.write(f"**Deepfake Percentage:** {results['deepfake_percentage']:.1f}%")
-                st.write(f"**Average Confidence:** {results['average_confidence']:.1f}%")
-        
-        # Export results
-        st.header("📥 Export Results")
-        
-        # Create downloadable report
-        report_data = {
-            'video_analysis_report': {
-                'overall_prediction': prediction,
-                'confidence': confidence,
-                'summary': results
-            }
-        }
-        
-        report_json = pd.Series(report_data).to_json(indent=2)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="📋 Download JSON Report",
-                data=report_json,
-                file_name=f"deepfake_analysis_{int(time.time())}.json",
-                mime="application/json"
-            )
-        
-        with col2:
-            # Create CSV summary
-            summary_df = pd.DataFrame([{
-                'Prediction': prediction,
-                'Confidence': f"{confidence:.1f}%",
-                'Deepfake_Frames': results['deepfake_frames'],
-                'Real_Frames': results['real_frames'],
-                'Total_Frames_Analyzed': results['total_analyzed_frames'],
-                'Duration_Seconds': results['duration'],
-                'Deepfake_Percentage': f"{results['deepfake_percentage']:.1f}%"
-            }])
-            
-            csv = summary_df.to_csv(index=False)
-            st.download_button(
-                label="📊 Download CSV Summary",
-                data=csv,
-                file_name=f"deepfake_summary_{int(time.time())}.csv",
-                mime="text/csv"
-            )
+    # Get or create sample video
+    print("\n5. Preparing sample video...")
+    video_path = download_sample_video()
+    
+    # Process video
+    print(f"\n6. Processing video: {video_path}")
+    print("Extracting faces and making predictions...")
+    predictions = processor.process_video(video_path, max_frames=20, frame_skip=3)
+    
+    if not predictions:
+        print("❌ No faces detected in the video!")
+        return
+    
+    # Visualize results
+    print(f"\n7. Analyzing {len(predictions)} face detections...")
+    visualize_results(predictions, video_path)
+    
+    print("\n✨ Analysis complete!")
 
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-    <div style='text-align: center; color: #666;'>
-        <p>⚠️ <strong>Disclaimer:</strong> This is a demonstration tool. Results should not be used as definitive proof of deepfake content. 
-        Professional verification is recommended for critical applications.</p>
-        <p>Built with Streamlit and TensorFlow | © 2025 Deepfake Detection System</p>
-    </div>
-    """, unsafe_allow_html=True)
+def upload_and_analyze_custom_video():
+    """
+    Function to analyze a custom uploaded video
+    """
+    from google.colab import files
+    
+    print("📁 Upload your video file:")
+    uploaded = files.upload()
+    
+    if not uploaded:
+        print("No file uploaded!")
+        return
+    
+    video_path = list(uploaded.keys())[0]
+    print(f"Processing uploaded video: {video_path}")
+    
+    # Initialize components
+    model = create_dummy_model()
+    face_extractor = FaceExtractor()
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    processor = VideoProcessor(model, face_extractor, transform)
+    
+    # Process the uploaded video
+    predictions = processor.process_video(video_path, max_frames=50, frame_skip=2)
+    
+    if predictions:
+        visualize_results(predictions, video_path)
+    else:
+        print("❌ No faces detected in the uploaded video!")
 
+# Run the main demonstration
 if __name__ == "__main__":
     main()
+    
+    upload_and_analyze_custom_video()
